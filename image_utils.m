@@ -51,6 +51,7 @@ static NSUInteger sLoadFailureCount = 0;
 static CFTimeInterval sLastCameraFrameAt = 0.0;
 static BOOL sVideoPlaybackPausedByUser = NO;
 static BOOL sVideoPausedForCameraIdle = NO;
+static dispatch_queue_t sPlayerControlQueue = nil;
 
 static void VCamEnsureState(void) {
     dispatch_once(&sLockOnce, ^{
@@ -63,6 +64,24 @@ static void VCamEnsureState(void) {
         dispatch_queue_attr_t videoQueueAttributes = dispatch_queue_attr_make_with_qos_class(
             DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
         sVideoFrameQueue = dispatch_queue_create("com.tinysweet.vcam.video-frame-pump", videoQueueAttributes);
+        sPlayerControlQueue = dispatch_queue_create("com.tinysweet.vcam.player-control", DISPATCH_QUEUE_SERIAL);
+    });
+}
+
+// AVPlayer control calls can block while mediaserverd talks to its own media
+// services. They must never run while sLock is held or on the camera callback
+// thread, otherwise a stuck player also stalls the camera pipeline.
+static void VCamPlayerPlayAsync(AVPlayer *player) {
+    if (!player || !sPlayerControlQueue) return;
+    dispatch_async(sPlayerControlQueue, ^{
+        [player play];
+    });
+}
+
+static void VCamPlayerPauseAsync(AVPlayer *player) {
+    if (!player || !sPlayerControlQueue) return;
+    dispatch_async(sPlayerControlQueue, ^{
+        [player pause];
     });
 }
 
@@ -105,7 +124,7 @@ static void VCamStartVideoFramePumpLocked(void) {
             // Stop decoding while no camera frames are flowing; it will resume
             // automatically when the camera pipeline starts calling us again.
             if (sLastCameraFrameAt > 0.0 && CACurrentMediaTime() - sLastCameraFrameAt > 2.0) {
-                [sVideoPlayer pause];
+                VCamPlayerPauseAsync(sVideoPlayer);
                 sVideoPausedForCameraIdle = YES;
                 sHasLoggedFirstVideoFrame = NO;
                 VCamStopVideoFramePumpLocked();
@@ -178,10 +197,15 @@ static void VCamStopVideoPlaybackLocked(void) {
         [[NSNotificationCenter defaultCenter] removeObserver:sVideoEndObserver];
         sVideoEndObserver = nil;
     }
-    [sVideoPlayer pause];
-    [sVideoPlayer replaceCurrentItemWithPlayerItem:nil];
+    AVPlayer *retiringPlayer = sVideoPlayer;
     sVideoPlayer = nil;
     sVideoOutput = nil;
+    if (retiringPlayer && sPlayerControlQueue) {
+        dispatch_async(sPlayerControlQueue, ^{
+            [retiringPlayer pause];
+            [retiringPlayer replaceCurrentItemWithPlayerItem:nil];
+        });
+    }
     if (sCurrentVideoBuffer) {
         CVPixelBufferRelease(sCurrentVideoBuffer);
         sCurrentVideoBuffer = NULL;
@@ -234,6 +258,12 @@ static BOOL VCamDecodeImage(NSString *path, UIImage **imageOut) {
     return YES;
 }
 
+// Shown by the SpringBoard menu next to "Media: LOADING". If loading ever hangs,
+// the last stage written here tells us which AVFoundation call never returned.
+static void VCamVideoStage(NSString *stage) {
+    VCamSetRuntimeStatus(@"mediaDetail", [NSString stringWithFormat:@"Preparing video: %@", stage]);
+}
+
 static BOOL VCamPrepareVideo(NSString *path,
                              AVPlayer **playerOut,
                              AVPlayerItemVideoOutput **outputOut,
@@ -244,8 +274,29 @@ static BOOL VCamPrepareVideo(NSString *path,
     if (observerOut) *observerOut = nil;
     if (preferredTransformOut) *preferredTransformOut = CGAffineTransformIdentity;
 
+    VCamVideoStage(@"1/5 creating asset");
     NSURL *url = [NSURL fileURLWithPath:path];
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:@{ AVURLAssetPreferPreciseDurationAndTimingKey: @NO }];
+
+    // -[AVAsset tracksWithMediaType:] loads synchronously and can block forever
+    // when AVFoundation runs inside mediaserverd. Load the tracks asynchronously
+    // and give up after a bounded wait instead of hanging this worker thread.
+    VCamVideoStage(@"2/5 loading video tracks (waits up to 10 s)");
+    dispatch_semaphore_t tracksLoaded = dispatch_semaphore_create(0);
+    [asset loadValuesAsynchronouslyForKeys:@[@"tracks"] completionHandler:^{
+        dispatch_semaphore_signal(tracksLoaded);
+    }];
+    if (dispatch_semaphore_wait(tracksLoaded, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0) {
+        VCamSetRuntimeStatus(@"mediaDetail", @"TIMEOUT at stage 2/5: AVFoundation did not finish loading the video tracks inside mediaserverd within 10 s");
+        return NO;
+    }
+    NSError *tracksError = nil;
+    if ([asset statusOfValueForKey:@"tracks" error:&tracksError] != AVKeyValueStatusLoaded) {
+        VCamSetRuntimeStatus(@"mediaDetail", tracksError.localizedDescription
+                             ? [NSString stringWithFormat:@"Stage 2/5 failed: %@", tracksError.localizedDescription]
+                             : @"Stage 2/5 failed: AVFoundation could not load the video tracks");
+        return NO;
+    }
     NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
     AVAssetTrack *videoTrack = tracks.firstObject;
     if (!videoTrack) {
@@ -254,6 +305,20 @@ static BOOL VCamPrepareVideo(NSString *path,
         return NO;
     }
 
+    // The orientation is a lazily loaded track property; read it with a bounded
+    // wait as well and fall back to "no rotation" if it is not available in time.
+    VCamVideoStage(@"3/5 reading video orientation (waits up to 5 s)");
+    CGAffineTransform trackTransform = CGAffineTransformIdentity;
+    dispatch_semaphore_t orientationLoaded = dispatch_semaphore_create(0);
+    [videoTrack loadValuesAsynchronouslyForKeys:@[@"preferredTransform"] completionHandler:^{
+        dispatch_semaphore_signal(orientationLoaded);
+    }];
+    if (dispatch_semaphore_wait(orientationLoaded, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0 &&
+        [videoTrack statusOfValueForKey:@"preferredTransform" error:NULL] == AVKeyValueStatusLoaded) {
+        trackTransform = videoTrack.preferredTransform;
+    }
+
+    VCamVideoStage(@"4/5 creating player item");
     NSDictionary *pixelAttributes = @{
         (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
         (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
@@ -266,6 +331,7 @@ static BOOL VCamPrepareVideo(NSString *path,
     // cached frames from a separate queue, so AVPlayer can use normal stall recovery.
     item.preferredForwardBufferDuration = 0.25;
 
+    VCamVideoStage(@"5/5 creating player");
     AVPlayer *player = [AVPlayer playerWithPlayerItem:item];
     player.muted = YES;
     player.volume = 0.0;
@@ -292,7 +358,7 @@ static BOOL VCamPrepareVideo(NSString *path,
     if (playerOut) *playerOut = player;
     if (outputOut) *outputOut = videoOutput;
     if (observerOut) *observerOut = endObserver;
-    if (preferredTransformOut) *preferredTransformOut = videoTrack.preferredTransform;
+    if (preferredTransformOut) *preferredTransformOut = trackTransform;
 
     VCamSetRuntimeStatus(@"mediaState", @"loaded-video");
     VCamSetRuntimeStatus(@"mediaDetail", @"Video player ready; imported video is normalized to a camera-friendly 1080p/30 FPS stream when supported");
@@ -402,7 +468,7 @@ void loadReplacementMedia(void) {
 
         if (!sEnabled) {
             if (sCurrentMode == VCamModeVideo) {
-                [sVideoPlayer pause];
+                VCamPlayerPauseAsync(sVideoPlayer);
                 VCamStopVideoFramePumpLocked();
                 VCamSetRuntimeStatus(@"videoFramePump", @"paused-replacement-disabled");
             }
@@ -423,14 +489,14 @@ void loadReplacementMedia(void) {
                 if (videoPaused) {
                     if (!sVideoPlaybackPausedByUser) {
                         sVideoPlaybackPausedByUser = YES;
-                        [sVideoPlayer pause];
+                        VCamPlayerPauseAsync(sVideoPlayer);
                         VCamStopVideoFramePumpLocked();
                         VCamSetRuntimeStatus(@"videoFramePump", @"paused-by-user");
                     }
                 } else if (sVideoPlaybackPausedByUser || sVideoPausedForCameraIdle || !sVideoFrameTimer) {
                     sVideoPlaybackPausedByUser = NO;
                     sVideoPausedForCameraIdle = NO;
-                    [sVideoPlayer play];
+                    VCamPlayerPlayAsync(sVideoPlayer);
                     VCamStartVideoFramePumpLocked();
                 }
             }
@@ -471,7 +537,7 @@ void loadReplacementMedia(void) {
 
             @synchronized (sLock) {
                 if (generation != sLoadGeneration) {
-                    [player pause];
+                    VCamPlayerPauseAsync(player);
                     if (endObserver) [[NSNotificationCenter defaultCenter] removeObserver:endObserver];
                     return;
                 }
@@ -510,10 +576,10 @@ void loadReplacementMedia(void) {
                     sVideoPlaybackPausedByUser = [VCamCopySetting(VCamVideoPausedKey) boolValue];
                     sVideoPausedForCameraIdle = NO;
                     if (!sEnabled || sVideoPlaybackPausedByUser) {
-                        [sVideoPlayer pause];
+                        VCamPlayerPauseAsync(sVideoPlayer);
                         if (sVideoPlaybackPausedByUser) VCamSetRuntimeStatus(@"videoFramePump", @"paused-by-user");
                     } else {
-                        [sVideoPlayer play];
+                        VCamPlayerPlayAsync(sVideoPlayer);
                         VCamStartVideoFramePumpLocked();
                     }
                 }
