@@ -20,14 +20,24 @@ typedef NS_ENUM(NSUInteger, VCamMode) {
     VCamModeVideo
 };
 
+// Decodes the selected video with AVAssetReader and paces the frames against the
+// wall clock. Only -initWithAsset:track: and the first -openReaderReportingStages:error:
+// run before the source is published; everything else runs on sVideoFrameQueue.
+@interface VCamVideoSource : NSObject
+@property (atomic, copy) NSString *failureDetail;
+@property (atomic) BOOL needsClockResume;
+- (instancetype)initWithAsset:(AVURLAsset *)asset track:(AVAssetTrack *)track;
+- (BOOL)openReaderReportingStages:(BOOL)reportStages error:(NSString **)errorOut;
+- (CVPixelBufferRef)copyFrameForHostTime:(CFTimeInterval)now;
+- (void)teardown;
+@end
+
 static NSObject *sLock = nil;
 static dispatch_once_t sLockOnce;
 static CIContext *sRenderContext = nil;
 static CGColorSpaceRef sRenderColorSpace = NULL;
 static UIImage *sReplacementImage = nil;
-static AVPlayer *sVideoPlayer = nil;
-static AVPlayerItemVideoOutput *sVideoOutput = nil;
-static id sVideoEndObserver = nil;
+static VCamVideoSource *sVideoSource = nil;
 static CVPixelBufferRef sCurrentVideoBuffer = NULL;
 static CGAffineTransform sVideoPreferredTransform = {1, 0, 0, 1, 0, 0};
 static VCamMode sCurrentMode = VCamModeNone;
@@ -51,7 +61,6 @@ static NSUInteger sLoadFailureCount = 0;
 static CFTimeInterval sLastCameraFrameAt = 0.0;
 static BOOL sVideoPlaybackPausedByUser = NO;
 static BOOL sVideoPausedForCameraIdle = NO;
-static dispatch_queue_t sPlayerControlQueue = nil;
 
 static void VCamEnsureState(void) {
     dispatch_once(&sLockOnce, ^{
@@ -64,24 +73,6 @@ static void VCamEnsureState(void) {
         dispatch_queue_attr_t videoQueueAttributes = dispatch_queue_attr_make_with_qos_class(
             DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
         sVideoFrameQueue = dispatch_queue_create("com.tinysweet.vcam.video-frame-pump", videoQueueAttributes);
-        sPlayerControlQueue = dispatch_queue_create("com.tinysweet.vcam.player-control", DISPATCH_QUEUE_SERIAL);
-    });
-}
-
-// AVPlayer control calls can block while mediaserverd talks to its own media
-// services. They must never run while sLock is held or on the camera callback
-// thread, otherwise a stuck player also stalls the camera pipeline.
-static void VCamPlayerPlayAsync(AVPlayer *player) {
-    if (!player || !sPlayerControlQueue) return;
-    dispatch_async(sPlayerControlQueue, ^{
-        [player play];
-    });
-}
-
-static void VCamPlayerPauseAsync(AVPlayer *player) {
-    if (!player || !sPlayerControlQueue) return;
-    dispatch_async(sPlayerControlQueue, ^{
-        [player pause];
     });
 }
 
@@ -101,45 +92,44 @@ static void VCamStopVideoFramePumpLocked(void) {
 
 // Pull decoded frames away from BWNodeOutput's real-time camera callback.
 // The camera callback only consumes the newest cached pixel buffer; it never
-// asks AVPlayer to decode or synchronize a frame itself.
+// asks the decoder for a frame itself.
 static void VCamStartVideoFramePumpLocked(void) {
-    if (sVideoFrameTimer || !sVideoPlayer || !sVideoOutput || !sEnabled) return;
+    if (sVideoFrameTimer || !sVideoSource || !sEnabled) return;
     if ([VCamCopySetting(VCamVideoPausedKey) boolValue]) return;
 
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, sVideoFrameQueue);
     if (!timer) return;
     sVideoFrameTimer = timer;
+    sVideoSource.needsClockResume = YES;
     VCamSetRuntimeStatus(@"videoFramePump", @"starting");
     dispatch_source_set_timer(timer,
                               dispatch_time(DISPATCH_TIME_NOW, 0),
-                              NSEC_PER_SEC / 30,
+                              NSEC_PER_SEC / 60,
                               2 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(timer, ^{
         @autoreleasepool {
-        AVPlayer *player = nil;
-        AVPlayerItemVideoOutput *output = nil;
+        VCamVideoSource *source = nil;
         @synchronized (sLock) {
-            if (sCurrentMode != VCamModeVideo || !sEnabled || sVideoPlayer == nil || sVideoOutput == nil) return;
-            // mediaserverd can keep the player alive after Camera is dismissed.
+            if (sCurrentMode != VCamModeVideo || !sEnabled || sVideoSource == nil) return;
+            // mediaserverd can keep the decoder alive after Camera is dismissed.
             // Stop decoding while no camera frames are flowing; it will resume
             // automatically when the camera pipeline starts calling us again.
             if (sLastCameraFrameAt > 0.0 && CACurrentMediaTime() - sLastCameraFrameAt > 2.0) {
-                VCamPlayerPauseAsync(sVideoPlayer);
                 sVideoPausedForCameraIdle = YES;
                 sHasLoggedFirstVideoFrame = NO;
                 VCamStopVideoFramePumpLocked();
                 VCamSetRuntimeStatus(@"videoFramePump", @"paused-camera-idle");
                 return;
             }
-            player = sVideoPlayer;
-            output = sVideoOutput;
+            source = sVideoSource;
         }
 
-        AVPlayerItem *activeItem = player.currentItem;
-        if (player.status == AVPlayerStatusFailed || activeItem.status == AVPlayerItemStatusFailed) {
-            NSString *failureDetail = activeItem.error.localizedDescription ?: player.error.localizedDescription ?: @"AVPlayer reported a playback failure";
+        CVPixelBufferRef nextBuffer = [source copyFrameForHostTime:CACurrentMediaTime()];
+        NSString *failureDetail = source.failureDetail;
+        if (failureDetail.length > 0) {
+            if (nextBuffer) CVPixelBufferRelease(nextBuffer);
             @synchronized (sLock) {
-                if (sVideoPlayer == player) {
+                if (sVideoSource == source) {
                     NSString *failedPath = [sLoadedPath copy];
                     VCamStopVideoPlaybackLocked();
                     sCurrentMode = VCamModeNone;
@@ -155,19 +145,13 @@ static void VCamStartVideoFramePumpLocked(void) {
             }
             return;
         }
-
-        CMTime itemTime = [output itemTimeForHostTime:CACurrentMediaTime()];
-        if (!CMTIME_IS_VALID(itemTime) || !CMTIME_IS_NUMERIC(itemTime)) itemTime = player.currentTime;
-        if (![output hasNewPixelBufferForItemTime:itemTime]) return;
-
-        CVPixelBufferRef nextBuffer = [output copyPixelBufferForItemTime:itemTime itemTimeForDisplay:NULL];
         if (!nextBuffer) return;
 
         BOOL accepted = NO;
         @synchronized (sLock) {
-            if (sCurrentMode == VCamModeVideo && sEnabled && sVideoPlayer == player && sVideoOutput == output) {
+            if (sCurrentMode == VCamModeVideo && sEnabled && sVideoSource == source) {
                 CVPixelBufferRef previousBuffer = sCurrentVideoBuffer;
-                sCurrentVideoBuffer = nextBuffer; // transfer the +1 reference returned by AVPlayerItemVideoOutput
+                sCurrentVideoBuffer = nextBuffer; // transfer the +1 reference returned by the reader
                 nextBuffer = NULL;
                 if (previousBuffer) CVPixelBufferRelease(previousBuffer);
                 accepted = YES;
@@ -193,17 +177,12 @@ static void VCamStartVideoFramePumpLocked(void) {
 
 static void VCamStopVideoPlaybackLocked(void) {
     VCamStopVideoFramePumpLocked();
-    if (sVideoEndObserver) {
-        [[NSNotificationCenter defaultCenter] removeObserver:sVideoEndObserver];
-        sVideoEndObserver = nil;
-    }
-    AVPlayer *retiringPlayer = sVideoPlayer;
-    sVideoPlayer = nil;
-    sVideoOutput = nil;
-    if (retiringPlayer && sPlayerControlQueue) {
-        dispatch_async(sPlayerControlQueue, ^{
-            [retiringPlayer pause];
-            [retiringPlayer replaceCurrentItemWithPlayerItem:nil];
+    VCamVideoSource *retiringSource = sVideoSource;
+    sVideoSource = nil;
+    if (retiringSource && sVideoFrameQueue) {
+        // Tear the reader down on the frame queue so it can never race a running tick.
+        dispatch_async(sVideoFrameQueue, ^{
+            [retiringSource teardown];
         });
     }
     if (sCurrentVideoBuffer) {
@@ -264,14 +243,135 @@ static void VCamVideoStage(NSString *stage) {
     VCamSetRuntimeStatus(@"mediaDetail", [NSString stringWithFormat:@"Preparing video: %@", stage]);
 }
 
+@implementation VCamVideoSource {
+    AVURLAsset *_asset;
+    AVAssetTrack *_track;
+    AVAssetReader *_reader;
+    AVAssetReaderTrackOutput *_output;
+    CMSampleBufferRef _pending;   // next frame: already decoded, not yet due
+    CFTimeInterval _clockStart;   // host time at which relative time 0 is shown
+    double _basePTS;              // presentation time of the first frame of this pass
+    BOOL _hasBase;
+    double _lastShownTime;        // relative time of the last frame handed out
+}
+
+- (instancetype)initWithAsset:(AVURLAsset *)asset track:(AVAssetTrack *)track {
+    self = [super init];
+    if (self) {
+        _asset = asset;
+        _track = track;
+    }
+    return self;
+}
+
+- (void)dealloc {
+    [self teardown];
+}
+
+- (void)teardown {
+    if (_reader && _reader.status == AVAssetReaderStatusReading) [_reader cancelReading];
+    _reader = nil;
+    _output = nil;
+    if (_pending) {
+        CFRelease(_pending);
+        _pending = NULL;
+    }
+}
+
+- (BOOL)openReaderReportingStages:(BOOL)reportStages error:(NSString **)errorOut {
+    [self teardown];
+    if (reportStages) VCamVideoStage(@"4/5 creating video reader");
+    NSError *error = nil;
+    AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:_asset error:&error];
+    if (!reader) {
+        if (errorOut) *errorOut = error.localizedDescription ?: @"AVAssetReader could not open the selected video";
+        return NO;
+    }
+    NSDictionary *settings = @{
+        (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)
+    };
+    AVAssetReaderTrackOutput *output = [[AVAssetReaderTrackOutput alloc] initWithTrack:_track
+                                                                         outputSettings:settings];
+    output.alwaysCopiesSampleData = NO;
+    if (![reader canAddOutput:output]) {
+        if (errorOut) *errorOut = @"AVAssetReader cannot create a decoded video output";
+        return NO;
+    }
+    [reader addOutput:output];
+    if (reportStages) VCamVideoStage(@"5/5 starting video decoder");
+    if (![reader startReading]) {
+        if (errorOut) *errorOut = reader.error.localizedDescription ?: @"AVAssetReader failed to start";
+        return NO;
+    }
+    _reader = reader;
+    _output = output;
+    _hasBase = NO;
+    return YES;
+}
+
+// Called only on the frame queue. Returns the newest frame that is due at
+// hostTime (+1 reference) or NULL when there is nothing new to show.
+- (CVPixelBufferRef)copyFrameForHostTime:(CFTimeInterval)now {
+    if (self.needsClockResume) {
+        self.needsClockResume = NO;
+        _clockStart = now - _lastShownTime;
+    }
+
+    CVPixelBufferRef result = NULL;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (!_pending) {
+            if (!_reader || _reader.status != AVAssetReaderStatusReading) {
+                if (_reader && _reader.status == AVAssetReaderStatusFailed) {
+                    self.failureDetail = _reader.error.localizedDescription ?: @"AVAssetReader failed while decoding the video";
+                    break;
+                }
+                // Reached the end of the file: start over so the video loops.
+                NSString *reopenError = nil;
+                if (![self openReaderReportingStages:NO error:&reopenError]) {
+                    self.failureDetail = reopenError ?: @"AVAssetReader could not restart the video";
+                    break;
+                }
+            }
+            _pending = [_output copyNextSampleBuffer];
+            if (!_pending) {
+                if (_reader.status == AVAssetReaderStatusFailed) {
+                    self.failureDetail = _reader.error.localizedDescription ?: @"AVAssetReader failed while decoding the video";
+                }
+                break;
+            }
+            if (!_hasBase) {
+                double firstPTS = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(_pending));
+                _basePTS = isfinite(firstPTS) ? firstPTS : 0.0;
+                _clockStart = now;
+                _lastShownTime = 0.0;
+                _hasBase = YES;
+            }
+        }
+
+        double pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(_pending));
+        double relative = isfinite(pts) ? MAX(0.0, pts - _basePTS) : _lastShownTime;
+        double elapsed = now - _clockStart;
+        if (relative > elapsed) break;                      // not due yet, keep it for the next tick
+        if (elapsed - relative > 0.25) _clockStart = now - relative; // far behind: resync instead of racing ahead
+
+        CVImageBufferRef image = CMSampleBufferGetImageBuffer(_pending);
+        if (image) {
+            if (result) CVPixelBufferRelease(result);
+            result = CVPixelBufferRetain(image);
+        }
+        _lastShownTime = relative;
+        CFRelease(_pending);
+        _pending = NULL;
+    }
+    return result;
+}
+
+@end
+
 static BOOL VCamPrepareVideo(NSString *path,
-                             AVPlayer **playerOut,
-                             AVPlayerItemVideoOutput **outputOut,
-                             id *observerOut,
+                             VCamVideoSource **sourceOut,
                              CGAffineTransform *preferredTransformOut) {
-    if (playerOut) *playerOut = nil;
-    if (outputOut) *outputOut = nil;
-    if (observerOut) *observerOut = nil;
+    if (sourceOut) *sourceOut = nil;
     if (preferredTransformOut) *preferredTransformOut = CGAffineTransformIdentity;
 
     VCamVideoStage(@"1/5 creating asset");
@@ -318,50 +418,22 @@ static BOOL VCamPrepareVideo(NSString *path,
         trackTransform = videoTrack.preferredTransform;
     }
 
-    VCamVideoStage(@"4/5 creating player item");
-    NSDictionary *pixelAttributes = @{
-        (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-        (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
-        (NSString *)kCVPixelBufferMetalCompatibilityKey: @YES
-    };
-    AVPlayerItemVideoOutput *videoOutput = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:pixelAttributes];
-    AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:asset];
-    [item addOutput:videoOutput];
-    // Keep a small decode-ahead window. The camera render callback consumes
-    // cached frames from a separate queue, so AVPlayer can use normal stall recovery.
-    item.preferredForwardBufferDuration = 0.25;
+    // AVPlayer / AVPlayerItem are intentionally not used: creating a player item
+    // inside mediaserverd never completes on some devices (the process is killed
+    // a few seconds later). AVAssetReader only needs the track that already loaded.
+    VCamVideoSource *source = [[VCamVideoSource alloc] initWithAsset:asset track:videoTrack];
+    NSString *openError = nil;
+    if (![source openReaderReportingStages:YES error:&openError]) {
+        VCamSetRuntimeStatus(@"mediaState", @"video-decode-start-failed");
+        VCamSetRuntimeStatus(@"mediaDetail", openError ?: @"AVAssetReader failed to start");
+        return NO;
+    }
 
-    VCamVideoStage(@"5/5 creating player");
-    AVPlayer *player = [AVPlayer playerWithPlayerItem:item];
-    player.muted = YES;
-    player.volume = 0.0;
-    player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
-    player.automaticallyWaitsToMinimizeStalling = YES;
-
-    __weak AVPlayer *weakPlayer = player;
-    id endObserver = [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
-                                                                        object:item
-                                                                         queue:nil
-                                                                    usingBlock:^(NSNotification *notification) {
-        AVPlayer *activePlayer = weakPlayer;
-        if (!activePlayer || activePlayer.currentItem != notification.object) return;
-        [activePlayer seekToTime:kCMTimeZero
-                 toleranceBefore:kCMTimeZero
-                  toleranceAfter:kCMTimeZero
-               completionHandler:^(BOOL finished) {
-            if ((finished || activePlayer.currentItem) && ![VCamCopySetting(VCamVideoPausedKey) boolValue]) {
-                [activePlayer play];
-            }
-        }];
-    }];
-
-    if (playerOut) *playerOut = player;
-    if (outputOut) *outputOut = videoOutput;
-    if (observerOut) *observerOut = endObserver;
+    if (sourceOut) *sourceOut = source;
     if (preferredTransformOut) *preferredTransformOut = trackTransform;
 
     VCamSetRuntimeStatus(@"mediaState", @"loaded-video");
-    VCamSetRuntimeStatus(@"mediaDetail", @"Video player ready; imported video is normalized to a camera-friendly 1080p/30 FPS stream when supported");
+    VCamSetRuntimeStatus(@"mediaDetail", @"Video decoder ready (AVAssetReader, no AVPlayer); imported video is normalized to a camera-friendly 1080p/30 FPS stream when supported");
     return YES;
 }
 
@@ -407,14 +479,10 @@ static BOOL VCamOpenSelectedMediaForRead(NSString *path) {
 
 static BOOL VCamDecodeMedia(NSString *path,
                             UIImage **imageOut,
-                            AVPlayer **playerOut,
-                            AVPlayerItemVideoOutput **videoOutputOut,
-                            id *observerOut,
+                            VCamVideoSource **sourceOut,
                             CGAffineTransform *preferredTransformOut) {
     if (imageOut) *imageOut = nil;
-    if (playerOut) *playerOut = nil;
-    if (videoOutputOut) *videoOutputOut = nil;
-    if (observerOut) *observerOut = nil;
+    if (sourceOut) *sourceOut = nil;
     if (preferredTransformOut) *preferredTransformOut = CGAffineTransformIdentity;
 
     if (!VCamOpenSelectedMediaForRead(path)) return NO;
@@ -423,7 +491,7 @@ static BOOL VCamDecodeMedia(NSString *path,
     NSSet *videoExtensions = [NSSet setWithArray:@[@"mp4", @"mov", @"m4v", @"3gp", @"3g2", @"avi", @"mts", @"m2ts", @"qt"]];
     NSString *mediaType = VCamCopySetting(VCamMediaTypeKey);
     if ([mediaType isEqualToString:@"video"] || [videoExtensions containsObject:extension]) {
-        return VCamPrepareVideo(path, playerOut, videoOutputOut, observerOut, preferredTransformOut);
+        return VCamPrepareVideo(path, sourceOut, preferredTransformOut);
     }
     return VCamDecodeImage(path, imageOut);
 }
@@ -468,7 +536,6 @@ void loadReplacementMedia(void) {
 
         if (!sEnabled) {
             if (sCurrentMode == VCamModeVideo) {
-                VCamPlayerPauseAsync(sVideoPlayer);
                 VCamStopVideoFramePumpLocked();
                 VCamSetRuntimeStatus(@"videoFramePump", @"paused-replacement-disabled");
             }
@@ -485,18 +552,16 @@ void loadReplacementMedia(void) {
         }
         newPath = observedPath;
         if ([newPath isEqualToString:sLoadedPath]) {
-            if (sCurrentMode == VCamModeVideo && sVideoPlayer) {
+            if (sCurrentMode == VCamModeVideo && sVideoSource) {
                 if (videoPaused) {
                     if (!sVideoPlaybackPausedByUser) {
                         sVideoPlaybackPausedByUser = YES;
-                        VCamPlayerPauseAsync(sVideoPlayer);
                         VCamStopVideoFramePumpLocked();
                         VCamSetRuntimeStatus(@"videoFramePump", @"paused-by-user");
                     }
                 } else if (sVideoPlaybackPausedByUser || sVideoPausedForCameraIdle || !sVideoFrameTimer) {
                     sVideoPlaybackPausedByUser = NO;
                     sVideoPausedForCameraIdle = NO;
-                    VCamPlayerPlayAsync(sVideoPlayer);
                     VCamStartVideoFramePumpLocked();
                 }
             }
@@ -529,16 +594,17 @@ void loadReplacementMedia(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
             UIImage *image = nil;
-            AVPlayer *player = nil;
-            AVPlayerItemVideoOutput *videoOutput = nil;
-            id endObserver = nil;
+            VCamVideoSource *videoSource = nil;
             CGAffineTransform preferredTransform = CGAffineTransformIdentity;
-            BOOL success = VCamDecodeMedia(newPath, &image, &player, &videoOutput, &endObserver, &preferredTransform);
+            BOOL success = VCamDecodeMedia(newPath, &image, &videoSource, &preferredTransform);
 
             @synchronized (sLock) {
                 if (generation != sLoadGeneration) {
-                    VCamPlayerPauseAsync(player);
-                    if (endObserver) [[NSNotificationCenter defaultCenter] removeObserver:endObserver];
+                    if (videoSource) {
+                        dispatch_async(sVideoFrameQueue, ^{
+                            [videoSource teardown];
+                        });
+                    }
                     return;
                 }
                 sIsLoading = NO;
@@ -567,19 +633,15 @@ void loadReplacementMedia(void) {
                     sCurrentMode = VCamModeImage;
                     VCamSetRuntimeStatus(@"mediaDetail", [NSString stringWithFormat:@"Photo ready (%zux%zu)", CGImageGetWidth(image.CGImage), CGImageGetHeight(image.CGImage)]);
                 } else {
-                    sVideoPlayer = player;
-                    sVideoOutput = videoOutput;
-                    sVideoEndObserver = endObserver;
+                    sVideoSource = videoSource;
                     sVideoPreferredTransform = preferredTransform;
                     sCurrentMode = VCamModeVideo;
                     sReplacementImage = nil;
                     sVideoPlaybackPausedByUser = [VCamCopySetting(VCamVideoPausedKey) boolValue];
                     sVideoPausedForCameraIdle = NO;
                     if (!sEnabled || sVideoPlaybackPausedByUser) {
-                        VCamPlayerPauseAsync(sVideoPlayer);
                         if (sVideoPlaybackPausedByUser) VCamSetRuntimeStatus(@"videoFramePump", @"paused-by-user");
                     } else {
-                        VCamPlayerPlayAsync(sVideoPlayer);
                         VCamStartVideoFramePumpLocked();
                     }
                 }
